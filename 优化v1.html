@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Optimized Ocean Volume Rendering</title>
+  <link href="../libs/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <script src="../libs/Build/Cesium/Cesium.js"></script>
+  <script src="../libs/Texture3D.js"></script>
+  <script src="../libs/dat.gui.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+    }
+
+    #cesiumContainer {
+      height: 100vh;
+      width: 100vw;
+    }
+
+    .colormap-legend {
+      position: absolute;
+      bottom: 20px;
+      right: 20px;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 15px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      backdrop-filter: blur(5px);
+    }
+
+    .colormap-preview {
+      width: 20px;
+      height: 200px;
+      border: 2px solid white;
+      border-radius: 3px;
+    }
+
+    .colormap-scale {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      height: 200px;
+      color: white;
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      font-weight: bold;
+      text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.8);
+    }
+
+    .scale-value {
+      text-align: left;
+      line-height: 1;
+      margin: -6px 0;
+    }
+
+    .scale-label {
+      color: #cccccc;
+      font-size: 10px;
+      text-align: center;
+      margin-top: 10px;
+      writing-mode: vertical-lr;
+      text-orientation: mixed;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="cesiumContainer"></div>
+
+  <div class="colormap-legend">
+    <canvas id="colormapPreview" class="colormap-preview" width="20" height="200"></canvas>
+    <div class="colormap-scale" id="colormapScale">
+      <div class="scale-value" id="scale-max">20.0°C</div>
+      <div class="scale-value" id="scale-high">17.5°C</div>
+      <div class="scale-value" id="scale-mid">15.0°C</div>
+      <div class="scale-value" id="scale-low">12.5°C</div>
+      <div class="scale-value" id="scale-min">10.0°C</div>
+    </div>
+    <div class="scale-label">Temperature</div>
+  </div>
+
+
+  <script type="module">
+    Cesium.Ion.defaultAccessToken =
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI5ZGU2NjQ2OS02YjNkLTQzMTktYjRlYy0wMDZiMTM4ZmVjY2QiLCJpZCI6MTU5MzI2LCJpYXQiOjE2OTE1NTY4Nzd9.JSvqpytgX_EUhxFmH_u7TbcTBXZh_xAa5UDC5Xc8mGM";
+
+
+
+    // Cache Manager
+    class CacheManager {
+      constructor() {
+        this.uniformCache = new Map();
+      }
+
+      getOrCreate(key, creator) {
+        if (!this.uniformCache.has(key)) {
+          this.uniformCache.set(key, creator());
+        }
+        return this.uniformCache.get(key);
+      }
+
+      clear() {
+        this.uniformCache.clear();
+      }
+    }
+
+    const cacheManager = new CacheManager();
+
+    // WGS84 Ellipsoid Parameters Class
+    class SimpleWGS84Ellipsoid {
+      constructor() {
+        this.semiMajorAxis = 6378137.0;
+        this.inverseFlattening = 298.257223563;
+        this.flattening = 1.0 / this.inverseFlattening;
+        this.semiMinorAxis = this.semiMajorAxis * (1.0 - this.flattening);
+        this.eccentricitySquared = 2.0 * this.flattening - this.flattening * this.flattening;
+        this.eccentricity = Math.sqrt(this.eccentricitySquared);
+        this.secondEccentricitySquared = this.eccentricitySquared / (1.0 - this.eccentricitySquared);
+        this.secondEccentricity = Math.sqrt(this.secondEccentricitySquared);
+      }
+
+      getPrimeVerticalRadiusOfCurvature(latitude) {
+        const sinLat = Math.sin(latitude);
+        return this.semiMajorAxis / Math.sqrt(1.0 - this.eccentricitySquared * sinLat * sinLat);
+      }
+
+      geodeticsToCartesian(longitude, latitude, height) {
+        const cosLat = Math.cos(latitude);
+        const sinLat = Math.sin(latitude);
+        const cosLon = Math.cos(longitude);
+        const sinLon = Math.sin(longitude);
+        const N = this.getPrimeVerticalRadiusOfCurvature(latitude);
+        const x = (N + height) * cosLat * cosLon;
+        const y = (N + height) * cosLat * sinLon;
+        const z = (N * (1.0 - this.eccentricitySquared) + height) * sinLat;
+        return new Cesium.Cartesian3(x, y, z);
+      }
+    }
+
+    const wgs84 = new SimpleWGS84Ellipsoid();
+
+    const dataJson = await Cesium.Resource.fetch({ url: "../data/temp20.json" });
+    // const dataJson = await Cesium.Resource.fetch({ url: "../data/sal20.json" });
+    const { values, heights, ...options } = JSON.parse(dataJson);
+    options.heights = heights;
+    const layers = heights.length;
+
+    const minTemp = values.reduce((min, val) => val === 9999.0 ? min : Math.min(min, val), Infinity);
+    const maxTemp = values.reduce((max, val) => val === 9999.0 ? max : Math.max(max, val), -Infinity);
+
+    console.log("Temperature Range:", minTemp, "to", maxTemp);
+    console.log("Height Layers:", layers);
+    console.log("Height Range:", heights[0], "to", heights[layers - 1]);
+
+    const origin = Cesium.Cartesian3.fromDegrees(options.xmin, options.ymin, options.zmin);
+    const center = Cesium.Cartesian3.midpoint(
+      origin,
+      Cesium.Cartesian3.fromDegrees(options.xmax, options.ymax, options.zmax),
+      new Cesium.Cartesian3()
+    );
+
+    // Optimized WGS84 Ellipsoid Geometry Generator
+    class WGS84EllipsoidGeometryPool {
+      constructor() {
+        this.pool = new Map();
+        this.wgs84Ellipsoid = new SimpleWGS84Ellipsoid();
+      }
+
+      getEllipsoidShell(key, options) {
+        if (!this.pool.has(key)) {
+          this.pool.set(key, this.createWGS84EllipsoidShell(options));
+        }
+        return this.pool.get(key);
+      }
+
+      createWGS84EllipsoidShell(options) {
+        console.log("Creating optimized WGS84 ellipsoid geometry...");
+
+        const lonRange = options.xmax - options.xmin;
+        const latRange = options.ymax - options.ymin;
+
+        // Optimization: Dynamically adjust resolution based on region size
+        const cols = Math.max(16, Math.min(48, Math.ceil(lonRange / 3.0)));
+        const rows = Math.max(8, Math.min(24, Math.ceil(latRange / 3.0)));
+
+        const xmin = Cesium.Math.toRadians(options.xmin || -180);
+        const xmax = Cesium.Math.toRadians(options.xmax || 180);
+        const ymin = Cesium.Math.toRadians(options.ymin || -90);
+        const ymax = Cesium.Math.toRadians(options.ymax || 90);
+
+        const lonSegs = cols - 1;
+        const latSegs = rows - 1;
+        const lonRange_rad = xmax - xmin;
+        const latRange_rad = ymax - ymin;
+
+        const positions = [];
+        const indices = [];
+
+        // Pre-compute longitude and latitude grid points
+        const longitudes = new Float64Array(cols);
+        const latitudes = new Float64Array(rows);
+
+        for (let j = 0; j < cols; j++) {
+          longitudes[j] = xmin + (j / lonSegs) * lonRange_rad;
+        }
+
+        for (let i = 0; i < rows; i++) {
+          latitudes[i] = ymin + (i / latSegs) * latRange_rad;
+        }
+
+        // Generate inner layer vertices
+        for (let i = 0; i < rows; i++) {
+          for (let j = 0; j < cols; j++) {
+            const point = this.wgs84Ellipsoid.geodeticsToCartesian(
+              longitudes[j],
+              latitudes[i],
+              options.innerHeight
+            );
+            positions.push(point.x, point.y, point.z);
+          }
+        }
+
+        // Generate outer layer vertices
+        const outerOffset = positions.length / 3;
+        for (let i = 0; i < rows; i++) {
+          for (let j = 0; j < cols; j++) {
+            const point = this.wgs84Ellipsoid.geodeticsToCartesian(
+              longitudes[j],
+              latitudes[i],
+              options.outerHeight
+            );
+            positions.push(point.x, point.y, point.z);
+          }
+        }
+
+        const gridCols = cols;
+
+        // Inner surface indices
+        for (let i = 0; i < latSegs; i++) {
+          for (let j = 0; j < lonSegs; j++) {
+            const a = i * gridCols + j;
+            const b = a + 1;
+            const c = a + gridCols;
+            const d = c + 1;
+            indices.push(a, c, b, b, c, d);
+          }
+        }
+
+        // Outer surface indices
+        for (let i = 0; i < latSegs; i++) {
+          for (let j = 0; j < lonSegs; j++) {
+            const a = outerOffset + i * gridCols + j;
+            const b = a + 1;
+            const c = a + gridCols;
+            const d = c + 1;
+            indices.push(a, b, c, b, d, c);
+          }
+        }
+
+        // Side - top edge
+        for (let j = 0; j < lonSegs; j++) {
+          const i = 0;
+          const innerA = i * gridCols + j;
+          const innerB = innerA + 1;
+          const outerA = outerOffset + innerA;
+          const outerB = outerOffset + innerB;
+          indices.push(innerA, outerA, innerB, innerB, outerA, outerB);
+        }
+
+        // Bottom edge
+        for (let j = 0; j < lonSegs; j++) {
+          const i = latSegs;
+          const innerA = i * gridCols + j;
+          const innerB = innerA + 1;
+          const outerA = outerOffset + innerA;
+          const outerB = outerOffset + innerB;
+          indices.push(innerA, innerB, outerA, innerB, outerB, outerA);
+        }
+
+        // Left edge
+        for (let i = 0; i < latSegs; i++) {
+          const j = 0;
+          const innerA = i * gridCols + j;
+          const innerC = innerA + gridCols;
+          const outerA = outerOffset + innerA;
+          const outerC = outerOffset + innerC;
+          indices.push(innerA, innerC, outerA, innerC, outerC, outerA);
+        }
+
+        // Right edge
+        for (let i = 0; i < latSegs; i++) {
+          const j = lonSegs;
+          const innerA = i * gridCols + j;
+          const innerC = innerA + gridCols;
+          const outerA = outerOffset + innerA;
+          const outerC = outerOffset + innerC;
+          indices.push(innerA, outerA, innerC, innerC, outerA, outerC);
+        }
+
+        const geometry = new Cesium.Geometry({
+          attributes: {
+            position: new Cesium.GeometryAttribute({
+              componentDatatype: Cesium.ComponentDatatype.DOUBLE,
+              componentsPerAttribute: 3,
+              values: new Float64Array(positions)
+            })
+          },
+          indices: new Uint32Array(indices),
+          primitiveType: Cesium.PrimitiveType.TRIANGLES,
+          boundingSphere: Cesium.BoundingSphere.fromVertices(positions)
+        });
+
+        console.log(`Geometry created: ${positions.length / 3} vertices, ${indices.length / 3} triangles`);
+        return geometry;
+      }
+    }
+
+    const geometryPool = new WGS84EllipsoidGeometryPool();
+
+    // Optimized Volume Rendering Class
+    class OptimizedCurvedBoxPrimitive {
+      constructor(values, options) {
+        this.values = values;
+        this.options = options;
+        this._drawCommand = undefined;
+        this._texture3D = undefined;
+
+        // Pre-compute height-related data
+        this.heightData = this.precomputeHeightData(options.heights);
+      }
+
+      precomputeHeightData(heights) {
+        const cacheKey = `height_${heights.join('_')}`;
+        return cacheManager.getOrCreate(cacheKey, () => {
+          const layers = heights.length;
+          const heightIntervals = [];
+          const heightRanges = [];
+
+          // Calculate adjacent layer intervals
+          for (let i = 0; i < layers - 1; i++) {
+            const interval = heights[i + 1] - heights[i];
+            heightIntervals.push(interval);
+            heightRanges.push(1.0 / interval);
+          }
+
+          const minInterval = Math.min(...heightIntervals);
+          const maxInterval = Math.max(...heightIntervals);
+          const avgInterval = heightIntervals.reduce((a, b) => a + b, 0) / heightIntervals.length;
+          const intervalRange = maxInterval - minInterval;
+
+          // Normalize layer spacing [0,1], 0=min spacing, 1=max spacing
+          const normalizedIntervals = new Float32Array(heightIntervals.map(interval =>
+            intervalRange > 0 ? (interval - minInterval) / intervalRange : 0.5
+          ));
+
+          console.log("Layer spacing statistics:", { minInterval, maxInterval, avgInterval });
+
+          return {
+            heightIntervals: new Float32Array(heightIntervals),
+            heightRanges: new Float32Array(heightRanges),
+            minHeight: heights[0],
+            maxHeight: heights[layers - 1],
+            minInterval,
+            maxInterval,
+            avgInterval,
+            intervalRange,
+            normalizedIntervals
+          };
+        });
+      }
+
+
+      createCommand(context) {
+
+        const geometryKey = `wgs84_shell_${this.options.cols}_${this.options.rows}`;
+        const geometry = geometryPool.getEllipsoidShell(geometryKey, {
+          innerHeight: this.options.zmin,
+          outerHeight: this.options.zmax,
+          xmin: this.options.xmin,
+          xmax: this.options.xmax,
+          ymin: this.options.ymin,
+          ymax: this.options.ymax,
+        });
+
+        const attributeLocations = Cesium.GeometryPipeline.createAttributeLocations(geometry);
+        const vertexArray = Cesium.VertexArray.fromGeometry({ context, geometry, attributeLocations });
+
+        // Create 3D texture
+        this._texture3D = new Texture3D({
+          context: context,
+          width: this.options.cols,
+          height: this.options.rows,
+          depth: this.options.layers,
+          pixelFormat: Cesium.PixelFormat.RED,
+          pixelDatatype: Cesium.PixelDatatype.FLOAT,
+          source: {
+            arrayBufferView: new Float32Array(this.values)
+          },
+          sampler: new Cesium.Sampler({
+            minificationFilter: Cesium.TextureMinificationFilter.LINEAR,
+            magnificationFilter: Cesium.TextureMagnificationFilter.LINEAR,
+            wrapS: Cesium.TextureWrap.CLAMP_TO_EDGE,
+            wrapT: Cesium.TextureWrap.CLAMP_TO_EDGE,
+            wrapR: Cesium.TextureWrap.CLAMP_TO_EDGE
+          })
+        });
+
+        const heightData = this.heightData;
+        const wgs84Ellipsoid = geometryPool.wgs84Ellipsoid;
+
+        const uniformMap = {
+          map: () => this._texture3D,
+          opacity: () => params.opacity,
+          baseSampling: () => params.baseSampling,
+          heightAdaptive: () => params.heightAdaptive ? 1.0 : 0.0,
+          deepLayerMultiplier: () => params.deepLayerMultiplier,
+          shallowLayerMultiplier: () => params.shallowLayerMultiplier,
+          heightSensitivity: () => params.heightSensitivity,
+          volumeHeight: () => Math.abs(this.options.zmax - this.options.zmin),
+          longitudeMin: () => Cesium.Math.toRadians(this.options.xmin),
+          longitudeMax: () => Cesium.Math.toRadians(this.options.xmax),
+          latitudeMin: () => Cesium.Math.toRadians(this.options.ymin),
+          latitudeMax: () => Cesium.Math.toRadians(this.options.ymax),
+          u_minTemp: () => minTemp,
+          u_maxTemp: () => maxTemp,
+          u_colormap: () => colormaps[params.colormap],
+          xClipValue: () => params.xClipValue,
+          yClipValue: () => params.yClipValue,
+          zClipValue: () => params.zClipValue,
+          u_wgs84_semiMajorAxis: () => wgs84Ellipsoid.semiMajorAxis,
+          u_wgs84_semiMinorAxis: () => wgs84Ellipsoid.semiMinorAxis,
+          u_wgs84_flattening: () => wgs84Ellipsoid.flattening,
+          u_wgs84_eccentricitySquared: () => wgs84Ellipsoid.eccentricitySquared,
+          u_wgs84_secondEccentricitySquared: () => wgs84Ellipsoid.secondEccentricitySquared,
+          u_heights: () => this.options.heights,
+          u_heightIntervals: () => heightData.heightIntervals,
+          u_heightRanges: () => heightData.heightRanges,
+          u_normalizedIntervals: () => heightData.normalizedIntervals,
+          u_layers: () => this.options.layers,
+          u_minHeight: () => heightData.minHeight,
+          u_maxHeight: () => heightData.maxHeight,
+          u_minInterval: () => heightData.minInterval,
+          u_maxInterval: () => heightData.maxInterval,
+          u_intervalRange: () => heightData.intervalRange,
+        };
+
+        const shaderProgram = Cesium.ShaderProgram.fromCache({
+          context,
+          vertexShaderSource: `
+in vec3 position3DHigh;
+in vec3 position3DLow;
+
+out vec3 vOrigin;
+out vec3 vDirection;
+out vec3 vWorldPosition;
+
+vec4 translateRelativeToEye(vec3 high, vec3 low) {
+    vec3 highDifference = high - czm_encodedCameraPositionMCHigh;
+    vec3 lowDifference = low - czm_encodedCameraPositionMCLow;
+    return vec4(highDifference + lowDifference, 1.0);
+}
+
+void main() {
+    vec4 p = translateRelativeToEye(position3DHigh, position3DLow);
+    vOrigin = czm_encodedCameraPositionMCHigh + czm_encodedCameraPositionMCLow;
+    vec3 modelPosition = position3DHigh + position3DLow;
+    vWorldPosition = modelPosition;
+    vDirection = modelPosition - vOrigin;
+    gl_Position = czm_modelViewProjectionRelativeToEye * p;
+}`,
+
+          fragmentShaderSource: `
+#version 300 es
+precision highp float;
+precision highp sampler3D;
+
+in vec3 vOrigin;
+in vec3 vDirection;
+in vec3 vWorldPosition;
+
+uniform sampler3D map;
+uniform float opacity;
+uniform float baseSampling;
+uniform float heightAdaptive;
+uniform float deepLayerMultiplier;
+uniform float shallowLayerMultiplier;
+uniform float heightSensitivity;
+uniform float volumeHeight;
+uniform float u_minTemp;
+uniform float u_maxTemp;
+uniform float longitudeMin;
+uniform float longitudeMax;
+uniform float latitudeMin;
+uniform float latitudeMax;
+uniform int u_colormap;
+uniform float xClipValue;
+uniform float yClipValue;
+uniform float zClipValue;
+
+uniform float u_wgs84_semiMajorAxis;
+uniform float u_wgs84_semiMinorAxis;
+uniform float u_wgs84_flattening;
+uniform float u_wgs84_eccentricitySquared;
+uniform float u_wgs84_secondEccentricitySquared;
+
+uniform float u_heights[48];
+uniform float u_heightIntervals[47];
+uniform float u_heightRanges[47];
+uniform float u_normalizedIntervals[47];
+uniform int u_layers;
+uniform float u_minHeight;
+uniform float u_maxHeight;
+uniform float u_minInterval;
+uniform float u_maxInterval;
+uniform float u_intervalRange;
+
+// Inline constants to avoid redundant computation
+const float INV_2A = 1.0 / (2.0 * 4.0);
+const float EARLY_RAY_TERMINATION = 0.01;
+const float MAX_STEP_CHANGE = 1.5;
+
+// WGS84 ellipsoid ray intersection
+vec2 intersectWGS84Ellipsoid(vec3 rayOrig, vec3 rayDir, float radiusScale) {
+    float a = u_wgs84_semiMajorAxis * radiusScale;
+    float c = u_wgs84_semiMinorAxis * radiusScale;
+    float a2_inv = 1.0 / (a * a);
+    float c2_inv = 1.0 / (c * c);
+    
+    float A = (rayDir.x * rayDir.x + rayDir.y * rayDir.y) * a2_inv + rayDir.z * rayDir.z * c2_inv;
+    float B = 2.0 * ((rayOrig.x * rayDir.x + rayOrig.y * rayDir.y) * a2_inv + rayOrig.z * rayDir.z * c2_inv);
+    float C = (rayOrig.x * rayOrig.x + rayOrig.y * rayOrig.y) * a2_inv + rayOrig.z * rayOrig.z * c2_inv - 1.0;
+    
+    float discriminant = B * B - 4.0 * A * C;
+    if (discriminant < 0.0) return vec2(-1.0);
+    
+    float sqrtD = sqrt(discriminant);
+    float invA = 0.5 / A;
+    return vec2((-B - sqrtD) * invA, (-B + sqrtD) * invA);
+}
+
+// WGS84 coordinate conversion
+vec3 cartesianToGeodetic(vec3 cartesian) {
+    float x = cartesian.x;
+    float y = cartesian.y;
+    float z = cartesian.z;
+    
+    float a = u_wgs84_semiMajorAxis;
+    float b = u_wgs84_semiMinorAxis;
+    float e2 = u_wgs84_eccentricitySquared;
+    float ep2 = u_wgs84_secondEccentricitySquared;
+    
+    float longitude = atan(y, x);
+    float p = sqrt(x * x + y * y);
+    
+    // Initial estimate
+    float theta = atan(z * a, p * b);
+    float sinTheta = sin(theta);
+    float cosTheta = cos(theta);
+    
+    float latitude = atan(z + ep2 * b * sinTheta * sinTheta * sinTheta,
+                         p - e2 * a * cosTheta * cosTheta * cosTheta);
+    
+    // Iteration count is 3
+    float sinLat = sin(latitude);
+    float cosLat = cos(latitude);
+    float N = a / sqrt(1.0 - e2 * sinLat * sinLat);
+    float h = p / cosLat - N;
+    
+    for (int i = 0; i < 2; i++) {
+        latitude = atan(z / p / (1.0 - e2 * N / (N + h)));
+        sinLat = sin(latitude);
+        cosLat = cos(latitude);
+        N = a / sqrt(1.0 - e2 * sinLat * sinLat);
+        h = p / cosLat - N;
+    }
+    
+    return vec3(longitude, latitude, h);
+}
+
+// World coordinates to spherical coordinates conversion
+vec3 worldToSpherical(vec3 worldPos) {
+    vec3 geodetic = cartesianToGeodetic(worldPos);
+    float longitude = geodetic.x;
+    float latitude = geodetic.y;
+    float height = geodetic.z;
+    
+    // Early culling
+    if (longitude < longitudeMin || longitude > longitudeMax || 
+        latitude < latitudeMin || latitude > latitudeMax) {
+        return vec3(-1.0);
+    }
+    
+    float normalizedLongitude = (longitude - longitudeMin) / (longitudeMax - longitudeMin);
+    float normalizedLatitude = (latitude - latitudeMin) / (latitudeMax - latitudeMin);
+    float altitude = (height - u_minHeight) / volumeHeight;
+    
+    return vec3(normalizedLongitude, normalizedLatitude, clamp(altitude, 0.0, 1.0));
+}
+
+// Lookup table method for calculating height layer spacing coefficient
+float getHeightLayerFactor(float altitude) {
+    if (heightAdaptive < 0.5) return 1.0;
+    
+    float actualHeight = altitude * volumeHeight + u_minHeight;
+    
+    // Boundary cases quick return
+    if (actualHeight <= u_minHeight) return u_normalizedIntervals[0];
+    if (actualHeight >= u_maxHeight) return u_normalizedIntervals[u_layers - 2];
+    
+    // Use linear search (faster for 48 layers)
+    for (int i = 0; i < 47; i++) {
+        if (actualHeight < u_heights[i + 1]) {
+            return u_normalizedIntervals[i];
+        }
+    }
+    
+    return u_normalizedIntervals[46];
+}
+
+// Sampling density calculation based on height layer spacing
+float calculateAdaptiveSampling(float altitude) {
+    if (heightAdaptive < 0.5) return 1.0;
+    
+    float intervalFactor = getHeightLayerFactor(altitude);
+    
+    // Deep layer (large spacing) = low sampling, Shallow layer (small spacing) = high sampling
+    // intervalFactor: 0=small spacing, 1=large spacing
+    float heightFactor = pow(1.0 - intervalFactor, heightSensitivity);
+    
+    // Blend deep and shallow layer sampling multipliers
+    float samplingMultiplier = mix(deepLayerMultiplier, shallowLayerMultiplier, heightFactor);
+    
+    return samplingMultiplier;
+}
+
+// Sampling density calculation (position-based)
+float calculateSamplingDensity(vec3 worldPos) {
+    float heightFactor = 1.0;
+    
+    if (heightAdaptive > 0.5) {
+        vec3 sphericalCoords = worldToSpherical(worldPos);
+        if (sphericalCoords.x >= 0.0) {
+            heightFactor = calculateAdaptiveSampling(sphericalCoords.z);
+        }
+    }
+    
+    return baseSampling * heightFactor;
+}
+
+// Non-uniform Z index calculation
+float getNonUniformZIndex(float altitude) {
+    float actualHeight = altitude * volumeHeight + u_minHeight;
+    
+    if (actualHeight <= u_minHeight) return 0.0;
+    if (actualHeight >= u_maxHeight) return float(u_layers - 1);
+    
+    // Linear search (fast enough for 48 layers)
+    for (int i = 0; i < 47; i++) {
+        if (actualHeight < u_heights[i + 1]) {
+            float t = (actualHeight - u_heights[i]) * u_heightRanges[i];
+            return float(i) + t;
+        }
+    }
+    
+    return float(u_layers - 1);
+}
+
+// Color mapping function
+vec3 applyColormap(float t, int colormapType) {
+    t = clamp(t, 0.0, 1.0);
+    
+    if (colormapType == 0) { // Temperature
+        if (t < 0.25)      return mix(vec3(0.0, 0.0, 1.0), vec3(0.0, 1.0, 1.0), t * 4.0);
+        else if (t < 0.5)  return mix(vec3(0.0, 1.0, 1.0), vec3(0.0, 1.0, 0.0), (t - 0.25) * 4.0);
+        else if (t < 0.75) return mix(vec3(0.0, 1.0, 0.0), vec3(1.0, 1.0, 0.0), (t - 0.5) * 4.0);
+        else               return mix(vec3(1.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), (t - 0.75) * 4.0);
+    }
+    else { // Viridis
+        if (t < 0.2)       return mix(vec3(0.267004, 0.004874, 0.329415), vec3(0.282623, 0.140926, 0.457517), t * 5.0);
+        else if (t < 0.4)  return mix(vec3(0.282623, 0.140926, 0.457517), vec3(0.253935, 0.265254, 0.529983), (t - 0.2) * 5.0);
+        else if (t < 0.6)  return mix(vec3(0.253935, 0.265254, 0.529983), vec3(0.163625, 0.471133, 0.558148), (t - 0.4) * 5.0);
+        else if (t < 0.8)  return mix(vec3(0.163625, 0.471133, 0.558148), vec3(0.127568, 0.566949, 0.550556), (t - 0.6) * 5.0);
+        else               return mix(vec3(0.127568, 0.566949, 0.550556), vec3(0.993248, 0.906157, 0.143936), (t - 0.8) * 5.0);
+    }
+}
+
+// Transfer function
+vec4 transferFunction(float value) {
+    if (value == 9999.0 || value <= u_minTemp || value >= u_maxTemp) return vec4(0.0);
+    
+    float t = (value - u_minTemp) / (u_maxTemp - u_minTemp);
+    vec3 rgb = applyColormap(t, u_colormap);
+    
+    return vec4(rgb, opacity);
+}
+
+// Sampling function
+float sampleTemperature(vec3 worldPos) {
+    vec3 sphericalCoords = worldToSpherical(worldPos);
+    if (sphericalCoords.x < 0.0) return 9999.0;
+    
+    float zIndex = getNonUniformZIndex(sphericalCoords.z);
+    float zTex = clamp(zIndex / float(u_layers - 1), 0.0, 1.0);
+    
+    vec3 textureCoords = vec3(sphericalCoords.x, sphericalCoords.y, zTex);
+    return texture(map, textureCoords).r;
+}
+
+// Clipping check
+bool shouldClip(vec3 worldPos, vec3 sphericalCoords) {
+    if (sphericalCoords.x < 0.0) return true;
+    return (sphericalCoords.x > xClipValue) || 
+           (sphericalCoords.y > yClipValue) || 
+           (sphericalCoords.z > zClipValue);
+}
+
+void main() {
+    vec3 rayOrig = vOrigin;
+    vec3 rayDir = normalize(vDirection);
+    
+    float innerScale = 1.0 + u_minHeight / u_wgs84_semiMajorAxis;
+    float outerScale = 1.0 + (u_minHeight + volumeHeight) / u_wgs84_semiMajorAxis;
+    
+    vec2 outerIntersection = intersectWGS84Ellipsoid(rayOrig, rayDir, outerScale);
+    vec2 innerIntersection = intersectWGS84Ellipsoid(rayOrig, rayDir, innerScale);
+
+    float startT, endT;
+    float rayOriginDistance = length(rayOrig);
+    float innerRadius = u_wgs84_semiMajorAxis * innerScale;
+    float outerRadius = u_wgs84_semiMajorAxis * outerScale;
+    
+    if (rayOriginDistance <= innerRadius) {
+        startT = innerIntersection.y;
+        endT = outerIntersection.y;
+    } else if (rayOriginDistance <= outerRadius) {
+        startT = max(0.0, outerIntersection.x);
+        endT = (innerIntersection.x > startT) ? innerIntersection.x : outerIntersection.y;
+    } else {
+        startT = outerIntersection.x;
+        endT = (innerIntersection.x > startT) ? innerIntersection.x : outerIntersection.y;
+    }
+    
+    if (endT <= startT || endT < 0.0) discard;
+
+    float rayLength = endT - startT;
+    
+    // Use midpoint sampling density as baseline for the entire ray
+    vec3 rayMidPoint = rayOrig + rayDir * (startT + endT) * 0.5;
+    float baseDensity = calculateSamplingDensity(rayMidPoint);
+    float baseStepSize = rayLength / baseDensity;
+    
+    // Volume rendering main loop - Front-to-back compositing
+    // Formula: C_acc = Σ α_i * (1 - A_{i-1}) * c_i
+    //          A_i = A_{i-1} + α_i * (1 - A_{i-1})
+    vec3 accumulatedColor = vec3(0.0);  // C_acc: accumulated color
+    float accumulatedAlpha = 0.0;       // A: accumulated opacity
+    float currentT = startT;
+    
+    // Pre-compute common values for ray marching
+    const int MAX_STEPS = 512;
+    int stepCount = 0;
+    
+    while (currentT < endT && accumulatedAlpha < (1.0 - EARLY_RAY_TERMINATION) && stepCount < MAX_STEPS) {
+        vec3 samplePos = rayOrig + rayDir * currentT;
+        vec3 sphericalCoords = worldToSpherical(samplePos);
+        
+        // Early culling
+        if (sphericalCoords.x < 0.0 || shouldClip(samplePos, sphericalCoords)) {
+            currentT += baseStepSize;
+            stepCount++;
+            continue;
+        }
+        
+        // Calculate local sampling density
+        float localDensity = 1.0;
+        if (heightAdaptive > 0.5) {
+            localDensity = calculateAdaptiveSampling(sphericalCoords.z);
+        }
+        
+        float localStepSize = baseStepSize / localDensity;
+        
+        // Limit step size change magnitude
+        localStepSize = clamp(localStepSize, baseStepSize / MAX_STEP_CHANGE, baseStepSize * MAX_STEP_CHANGE);
+        
+        // Ensure not exceeding ray range
+        if (currentT + localStepSize > endT) {
+            localStepSize = endT - currentT;
+        }
+        
+        // Sample and accumulate
+        float temperature = sampleTemperature(samplePos);
+        vec4 rgba = transferFunction(temperature);
+
+        if (rgba.a > 0.0) {
+            // Adjust alpha based on step size for consistent opacity
+            float alphaAdjustment = localStepSize / baseStepSize;
+            float alpha_i = rgba.a * alphaAdjustment;  // α_i: current sample opacity
+            vec3 color_i = rgba.rgb;                    // c_i: current sample color
+            
+            // Front-to-back compositing:
+            // C_acc = C_acc + α_i * (1 - A_{i-1}) * c_i
+            // A_i = A_{i-1} + α_i * (1 - A_{i-1})
+            float oneMinusAccAlpha = 1.0 - accumulatedAlpha;
+            accumulatedColor += alpha_i * oneMinusAccAlpha * color_i;
+            accumulatedAlpha += alpha_i * oneMinusAccAlpha;
+        }
+        
+        currentT += localStepSize;
+        stepCount++;
+    }
+
+    if (accumulatedAlpha < 0.01) discard;
+    out_FragColor = vec4(accumulatedColor, accumulatedAlpha);
+}`,
+          attributeLocations
+        });
+
+        this._drawCommand = new Cesium.DrawCommand({
+          modelMatrix: Cesium.Matrix4.IDENTITY,
+          primitiveType: geometry.primitiveType,
+          vertexArray,
+          shaderProgram,
+          pass: Cesium.Pass.TRANSLUCENT,
+          boundingVolume: geometry.boundingSphere,
+          uniformMap,
+          renderState: Cesium.RenderState.fromCache({
+            depthTest: { enabled: true },
+            depthMask: false,
+            cull: { enabled: false },
+            blending: Cesium.BlendingState.ALPHA_BLEND
+          }),
+        });
+      }
+
+      update(frameState) {
+        if (!this._drawCommand) this.createCommand(frameState.context);
+        frameState.commandList.push(this._drawCommand);
+      }
+
+      destroy() {
+        if (this._texture3D && !this._texture3D.isDestroyed()) {
+          this._texture3D.destroy();
+        }
+        if (this._drawCommand && this._drawCommand.shaderProgram) {
+          this._drawCommand.shaderProgram.destroy();
+        }
+      }
+    }
+
+    const colormaps = {
+      'Temperature': 0,
+      'Viridis': 1
+    };
+
+    function getColormapRGB(t, colormap) {
+      let color = [0, 0, 0];
+      const colormapIndex = colormaps[colormap];
+
+      if (colormapIndex === 0) {
+        if (t < 0.25) {
+          const ratio = t / 0.25;
+          color = [0, ratio, 1];
+        } else if (t < 0.5) {
+          const ratio = (t - 0.25) / 0.25;
+          color = [0, 1, 1 - ratio];
+        } else if (t < 0.75) {
+          const ratio = (t - 0.5) / 0.25;
+          color = [ratio, 1, 0];
+        } else {
+          const ratio = (t - 0.75) / 0.25;
+          color = [1, 1 - ratio, 0];
+        }
+      } else {
+        const c0 = [0.267004, 0.004874, 0.329415];
+        const c1 = [0.229739, 0.322361, 0.545706];
+        const c2 = [0.127568, 0.566949, 0.550556];
+        const c3 = [0.369214, 0.788888, 0.382914];
+        const c4 = [0.993248, 0.906157, 0.143936];
+
+        if (t < 0.25) {
+          const ratio = t / 0.25;
+          color = [
+            c0[0] + ratio * (c1[0] - c0[0]),
+            c0[1] + ratio * (c1[1] - c0[1]),
+            c0[2] + ratio * (c1[2] - c0[2])
+          ];
+        } else if (t < 0.5) {
+          const ratio = (t - 0.25) / 0.25;
+          color = [
+            c1[0] + ratio * (c2[0] - c1[0]),
+            c1[1] + ratio * (c2[1] - c1[1]),
+            c1[2] + ratio * (c2[2] - c1[2])
+          ];
+        } else if (t < 0.75) {
+          const ratio = (t - 0.5) / 0.25;
+          color = [
+            c2[0] + ratio * (c3[0] - c2[0]),
+            c2[1] + ratio * (c3[1] - c2[1]),
+            c2[2] + ratio * (c3[2] - c2[2])
+          ];
+        } else {
+          const ratio = (t - 0.75) / 0.25;
+          color = [
+            c3[0] + ratio * (c4[0] - c3[0]),
+            c3[1] + ratio * (c4[1] - c3[1]),
+            c3[2] + ratio * (c4[2] - c3[2])
+          ];
+        }
+      }
+
+      return color.map(c => Math.max(0, Math.min(1, c)));
+    }
+
+    function updateColormapPreview() {
+      const canvas = document.getElementById('colormapPreview');
+      const ctx = canvas.getContext('2d');
+      const imageData = ctx.createImageData(20, 200);
+
+      for (let y = 0; y < 200; y++) {
+        const t = (200 - y) / 200;
+        const rgb = getColormapRGB(t, params.colormap);
+
+        for (let x = 0; x < 20; x++) {
+          const index = (y * 20 + x) * 4;
+          imageData.data[index] = rgb[0] * 255;
+          imageData.data[index + 1] = rgb[1] * 255;
+          imageData.data[index + 2] = rgb[2] * 255;
+          imageData.data[index + 3] = 255;
+        }
+      }
+
+      ctx.putImageData(imageData, 0, 0);
+      updateScaleValues();
+    }
+
+    function updateScaleValues() {
+      const tempRange = maxTemp - minTemp;
+      document.getElementById('scale-max').textContent = `${maxTemp.toFixed(1)}°C`;
+      document.getElementById('scale-high').textContent = `${(minTemp + tempRange * 0.75).toFixed(1)}°C`;
+      document.getElementById('scale-mid').textContent = `${(minTemp + tempRange * 0.5).toFixed(1)}°C`;
+      document.getElementById('scale-low').textContent = `${(minTemp + tempRange * 0.25).toFixed(1)}°C`;
+      document.getElementById('scale-min').textContent = `${minTemp.toFixed(1)}°C`;
+    }
+
+
+    const viewer = new Cesium.Viewer("cesiumContainer", {
+      infoBox: false,
+      timeline: false,
+      animation: false,
+      baseLayerPicker: false,
+      sceneModePicker: false,
+      selectionIndicator: false,
+      shadows: false,
+      shouldAnimate: true,
+      scene3DOnly: true,
+      contextOptions: {
+        requestWebgl2: true,
+        webgl: {
+          failIfMajorPerformanceCaveat: false,
+          powerPreference: "high-performance",
+          antialias: false
+        }
+      },
+    });
+
+    const scene = viewer.scene;
+    scene.verticalExaggeration = 10.0;
+    viewer.scene.debugShowFramesPerSecond = true;
+    viewer.scene.globe.depthTestAgainstTerrain = false;
+    viewer.scene.logarithmicDepthBuffer = true;
+    viewer.cesiumWidget.creditContainer.style.display = "none";
+    viewer.scene.highDynamicRange = false;
+    viewer.postProcessStages.fxaa.enabled = false;
+
+    const optimizedBox = new OptimizedCurvedBoxPrimitive(values, options);
+    viewer.scene.primitives.add({
+      update: frameState => optimizedBox.update(frameState),
+      isDestroyed: () => false,
+      destroy: () => optimizedBox.destroy()
+    });
+
+    // Optimized sampling parameter configuration
+    window.params = {
+      opacity: 0.6,
+      baseSampling: 128, // Base sampling
+
+      // Deep layer with large spacing uses low sampling, shallow layer with small spacing uses high sampling
+      heightAdaptive: true,
+      deepLayerMultiplier: 0.5,    // Deep layer (4271m spacing) uses 0.5x sampling
+      shallowLayerMultiplier: 2.5, // Shallow layer (10m spacing) uses 2.5x sampling
+      heightSensitivity: 2.0,      // Increase sensitivity to better differentiate layers
+
+      colormap: 'Temperature',
+      xClipValue: 1,
+      yClipValue: 1,
+      zClipValue: 1,
+      showBounds: false,  // Show data boundary box
+    };
+
+    const gui = new dat.GUI();
+
+    const samplingFolder = gui.addFolder('Sampling Settings');
+    samplingFolder.add(params, 'baseSampling', 32, 256).step(16).name('Base Sampling Steps');
+    samplingFolder.open();
+
+    const heightFolder = gui.addFolder('Smart Adaptive');
+    heightFolder.add(params, 'heightAdaptive').name('Enable Height Adaptive');
+    heightFolder.add(params, 'deepLayerMultiplier', 0.2, 1.0).name('Deep Layer Multiplier');
+    heightFolder.add(params, 'shallowLayerMultiplier', 1.5, 4.0).name('Shallow Layer Multiplier');
+    heightFolder.add(params, 'heightSensitivity', 0.5, 3.0).name('Sensitivity');
+    heightFolder.open();
+
+    const renderFolder = gui.addFolder('Render Settings');
+    renderFolder.add(params, 'opacity', 0, 1).name('Opacity');
+    renderFolder.add(params, 'colormap', Object.keys(colormaps)).name('Colormap').onChange(updateColormapPreview);
+    renderFolder.open();
+
+    const clipFolder = gui.addFolder('Clip Settings');
+    clipFolder.add(params, 'xClipValue', 0, 1).name('X Axis Clip');
+    clipFolder.add(params, 'yClipValue', 0, 1).name('Y Axis Clip');
+    clipFolder.add(params, 'zClipValue', 0, 1).name('Z Axis Clip');
+
+    // Create boundary box for data volume
+    function createBoundaryBox() {
+      // 8 corner points of the bounding box (use real height values, Cesium handles verticalExaggeration automatically)
+      const corners = [
+        // Bottom face (zmin)
+        Cesium.Cartesian3.fromDegrees(options.xmin, options.ymin, options.zmin),
+        Cesium.Cartesian3.fromDegrees(options.xmax, options.ymin, options.zmin),
+        Cesium.Cartesian3.fromDegrees(options.xmax, options.ymax, options.zmin),
+        Cesium.Cartesian3.fromDegrees(options.xmin, options.ymax, options.zmin),
+        // Top face (zmax)
+        Cesium.Cartesian3.fromDegrees(options.xmin, options.ymin, options.zmax),
+        Cesium.Cartesian3.fromDegrees(options.xmax, options.ymin, options.zmax),
+        Cesium.Cartesian3.fromDegrees(options.xmax, options.ymax, options.zmax),
+        Cesium.Cartesian3.fromDegrees(options.xmin, options.ymax, options.zmax),
+      ];
+
+      // Create edge lines
+      const edgeIndices = [
+        // Bottom face edges
+        [0, 1], [1, 2], [2, 3], [3, 0],
+        // Top face edges
+        [4, 5], [5, 6], [6, 7], [7, 4],
+        // Vertical edges
+        [0, 4], [1, 5], [2, 6], [3, 7]
+      ];
+
+      const boundaryEntities = [];
+
+      edgeIndices.forEach(([i, j]) => {
+        const entity = viewer.entities.add({
+          polyline: {
+            positions: [corners[i], corners[j]],
+            width: 2,
+            material: new Cesium.PolylineGlowMaterialProperty({
+              glowPower: 0.2,
+              color: Cesium.Color.WHITE
+            }),
+            show: params.showBounds
+          }
+        });
+        boundaryEntities.push(entity);
+      });
+
+      return boundaryEntities;
+    }
+
+    const boundaryEntities = createBoundaryBox();
+
+    // Add Show Bounds checkbox to GUI
+    const displayFolder = gui.addFolder('Display Settings');
+    displayFolder.add(params, 'showBounds').name('Show Bounds').onChange((value) => {
+      boundaryEntities.forEach(entity => {
+        if (entity.polyline) {
+          entity.polyline.show = value;
+        }
+        if (entity.label) {
+          entity.label.show = value;
+        }
+      });
+    });
+    displayFolder.open();
+
+    // Initialize colormap preview
+    updateColormapPreview();
+
+    viewer.camera.flyTo({
+      destination: Cesium.Cartesian3.fromDegrees(118, 22.25, 7000000.0),
+      duration: 1.0,
+      orientation: {
+        heading: Cesium.Math.toRadians(0),
+        roll: 0.0
+      }
+    });
+
+  </script>
+</body>
+
+</html>
